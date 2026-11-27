@@ -432,16 +432,16 @@ impl Image<'static> {
    }
 }
 
-/// [`swap_protected`] for code pages. A signed image's `__TEXT` never takes
-/// `PROT_WRITE`, its maximum protection is `r-x`, so each page is copied
-/// writable with `VM_PROT_COPY`, which drops its execute bit until it is
-/// restored.
+/// [`swap_protected`] for code pages on non-macOS Apple targets. A signed
+/// image's `__TEXT` never takes `PROT_WRITE`, its maximum protection is `r-x`,
+/// so each page is copied writable with `VM_PROT_COPY`, which drops its execute
+/// bit until it is restored.
 ///
 /// # Safety
 ///
 /// As [`swap_protected`], and no thread runs code on these pages until this
 /// returns, since they are not executable meanwhile.
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
 unsafe fn swap_code(
    writes: &[(usize, usize)],
    page_size: usize,
@@ -491,6 +491,160 @@ unsafe fn swap_code(
    Ok(previous)
 }
 
+/// [`swap_protected`] for code pages on macOS. A signed image's `__TEXT` never
+/// takes `PROT_WRITE`, so each executable page is copied into a private scratch
+/// allocation, patched, protected to `prot`, and atomically remapped in place
+/// via `mach_vm_remap` without ever dropping `PROT_EXEC`.
+///
+/// # Safety
+///
+/// As [`swap_protected`], and every slot is a pointer-aligned word on one of
+/// the pages in `restore`.
+#[cfg(target_os = "macos")]
+unsafe fn swap_code(
+   writes: &[(usize, usize)],
+   page_size: usize,
+   restore: &[(usize, c_int)],
+) -> Result<Vec<usize>, crate::Error> {
+   const VM_PROT_READ: c_int = 1;
+   const VM_PROT_WRITE: c_int = 2;
+   const VM_PROT_COPY: c_int = 0x10;
+
+   let protect = |page: usize, prot: c_int| {
+      // SAFETY: `page` is a mapped page of this task the caller looked up.
+      let status = unsafe { vm_protect(mach_task_self_, page, page_size, 0, prot) };
+      if status == 0 {
+         Ok(())
+      } else {
+         Err(crate::Error::Protect {
+            addr:   page,
+            source: std::io::Error::other(format!("vm_protect returned {status}")),
+         })
+      }
+   };
+
+   let _serial = PROTECT
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+   let mut previous = vec![0usize; writes.len()];
+   let mut data_pages = Vec::new();
+   for &(page, prot) in restore {
+      if prot & libc::PROT_EXEC != 0 {
+         // SAFETY: `page..page + page_size` is mapped and every matching slot is
+         // pointer-aligned inside it.
+         unsafe { remap_exec_page(page, page_size, prot, writes, &mut previous) }?;
+         // SAFETY: `page` is mapped; this only drops stale instruction cache
+         // lines.
+         unsafe { sys_icache_invalidate(page as *mut c_void, page_size) };
+      } else {
+         data_pages.push((page, prot));
+      }
+   }
+   if !data_pages.is_empty() {
+      for (done, &(page, _)) in data_pages.iter().enumerate() {
+         if let Err(err) = protect(page, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) {
+            for &(done_page, done_prot) in &data_pages[..done] {
+               let _ = protect(done_page, done_prot);
+            }
+            return Err(err);
+         }
+      }
+      for (idx, &(slot, value)) in writes.iter().enumerate() {
+         let page = slot & !(page_size - 1);
+         if data_pages.iter().any(|&(p, _)| p == page) {
+            // SAFETY: the caller guarantees aligned slots, now writable.
+            previous[idx] =
+               unsafe { AtomicUsize::from_ptr(slot as *mut usize) }.swap(value, Ordering::AcqRel);
+         }
+      }
+      for &(page, prot) in &data_pages {
+         let _ = protect(page, prot);
+      }
+   }
+   Ok(previous)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn remap_exec_page(
+   page: usize,
+   page_size: usize,
+   prot: c_int,
+   writes: &[(usize, usize)],
+   previous: &mut [usize],
+) -> Result<(), crate::Error> {
+   const VM_FLAGS_FIXED: c_int = 0;
+   const VM_FLAGS_ANYWHERE: c_int = 0x1;
+   const VM_FLAGS_OVERWRITE: c_int = 0x4000;
+   const VM_INHERIT_COPY: u32 = 0x1;
+
+   let err = |msg: String| {
+      crate::Error::Protect {
+         addr:   page,
+         source: std::io::Error::other(msg),
+      }
+   };
+   let mut target = u64::try_from(page).map_err(|_| err("page address overflow".to_owned()))?;
+   let size = u64::try_from(page_size).map_err(|_| err("page size overflow".to_owned()))?;
+   let mut copy = 0u64;
+   // SAFETY: allocates a private anonymous scratch page in this process.
+   let kr = unsafe { mach_vm_allocate(mach_task_self_, &raw mut copy, size, VM_FLAGS_ANYWHERE) };
+   if kr != 0 {
+      return Err(err(format!("mach_vm_allocate returned {kr}")));
+   }
+   let Ok(copy_addr) = usize::try_from(copy) else {
+      // SAFETY: `copy` came from `mach_vm_allocate`.
+      unsafe { mach_vm_deallocate(mach_task_self_, copy, size) };
+      return Err(err("copy address overflow".to_owned()));
+   };
+   // SAFETY: `page..page + page_size` is readable and `copy_addr` holds
+   // `page_size` bytes.
+   unsafe { std::ptr::copy_nonoverlapping(page as *const u8, copy_addr as *mut u8, page_size) };
+   for (idx, &(slot, value)) in writes.iter().enumerate() {
+      if (slot & !(page_size - 1)) == page {
+         let dst = (copy_addr + (slot - page)) as *mut usize;
+         // SAFETY: `slot` is pointer-aligned within `page..page + page_size`.
+         unsafe {
+            previous[idx] = std::ptr::read(dst);
+            std::ptr::write(dst, value);
+         }
+      }
+   }
+   // SAFETY: `copy_addr` holds `page_size` patched bytes; flush D-cache/icache
+   // before switching permissions and remapping into the live executable page.
+   unsafe { sys_icache_invalidate(copy_addr as *mut c_void, page_size) };
+   // SAFETY: `copy` is our private scratch allocation of `size` bytes.
+   let prot_kr = unsafe { mach_vm_protect(mach_task_self_, copy, size, 0, prot) };
+   if prot_kr != 0 {
+      // SAFETY: frees temporary allocation before returning error.
+      unsafe { mach_vm_deallocate(mach_task_self_, copy, size) };
+      return Err(err(format!("mach_vm_protect returned {prot_kr}")));
+   }
+   let (mut cur, mut maxp) = (0, 0);
+   // SAFETY: atomically replaces the executable mapping at `page` without
+   // dropping `PROT_EXEC`.
+   let remap_kr = unsafe {
+      mach_vm_remap(
+         mach_task_self_,
+         &raw mut target,
+         size,
+         0,
+         VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+         mach_task_self_,
+         copy,
+         0,
+         &raw mut cur,
+         &raw mut maxp,
+         VM_INHERIT_COPY,
+      )
+   };
+   // SAFETY: unmaps the temporary scratch alias after remapping into `page`.
+   unsafe { mach_vm_deallocate(mach_task_self_, copy, size) };
+   if remap_kr != 0 {
+      return Err(err(format!("mach_vm_remap returned {remap_kr}")));
+   }
+   Ok(())
+}
+
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
    static mach_task_self_: u32;
@@ -510,6 +664,32 @@ unsafe extern "C" {
       info: *mut c_int,
       count: *mut u32,
       object_name: *mut u32,
+   ) -> c_int;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+   fn mach_vm_allocate(target: u32, address: *mut u64, size: u64, flags: c_int) -> c_int;
+   fn mach_vm_deallocate(target: u32, address: u64, size: u64) -> c_int;
+   fn mach_vm_protect(
+      target_task: u32,
+      address: u64,
+      size: u64,
+      set_maximum: i32,
+      new_protection: c_int,
+   ) -> c_int;
+   fn mach_vm_remap(
+      target_task: u32,
+      target_address: *mut u64,
+      size: u64,
+      mask: u64,
+      flags: c_int,
+      src_task: u32,
+      src_address: u64,
+      copy: i32,
+      cur_protection: *mut c_int,
+      max_protection: *mut c_int,
+      inheritance: u32,
    ) -> c_int;
 }
 
