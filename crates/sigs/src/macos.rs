@@ -3588,39 +3588,49 @@ pub fn modal(
    let (modal_child_div, children) = one("Modal::child<Div>", &sorted(childs))?;
 
    let carousel_bytes = b"game-server-shop-carousel";
-   let carousel = one("game-server-shop-carousel", &image.find_bytes(carousel_bytes))?;
-   let (carousel_site, _) = one("game-server-shop-carousel load", &refs_to(image, &[carousel]))?;
-   let (carousel_fn, _) = image
-      .function_bounds(carousel_site)
-      .ok_or("game-server-shop-carousel caller has no bounds")?;
-   let carousel_flat = flattened_at(image, carousel_fn);
-   let at = carousel_flat
-      .iter()
-      .position(|&(pc, _)| pc == carousel_site)
-      .ok_or("carousel load not in function")?;
-   let div_id = carousel_flat[at + 1..(at + 20).min(carousel_flat.len())]
-      .windows(2)
-      .find_map(|pair| {
-         match (pair[0].1, pair[1].1) {
-            (
-               Insn::MovZ {
-                  rd: 2,
-                  imm,
-                  wide: false,
-               },
-               Insn::Bl { target },
-            ) if imm == u64::try_from(carousel_bytes.len()).unwrap_or(0) => Some(target),
-            _ => None,
-         }
-      })
-      .ok_or("Div::id call after carousel anchor not found")?;
-   let (_, div_id_code) = arm64::function(image, div_id).ok_or("Div::id unreadable")?;
-   if !div_id_code
-      .iter()
-      .any(|&(_, insn)| matches!(insn, Insn::CmpImm { imm: 0xFF, .. }))
-   {
-      return Err("Div::id element_id check failed".to_owned());
+   let carousel_len = u64::try_from(carousel_bytes.len()).unwrap_or(0);
+   let carousels = image.find_bytes(carousel_bytes);
+   if carousels.is_empty() {
+      return Err("0 game-server-shop-carousel candidates".to_owned());
    }
+   let mut div_ids = Vec::new();
+   for (carousel_site, _) in refs_to(image, &carousels) {
+      let Some((carousel_fn, _)) = image.function_bounds(carousel_site) else {
+         continue;
+      };
+      let carousel_flat = flattened_at(image, carousel_fn);
+      let Some(at) = carousel_flat.iter().position(|&(pc, _)| pc == carousel_site) else {
+         continue;
+      };
+      let Some(candidate) = carousel_flat[at + 1..(at + 20).min(carousel_flat.len())]
+         .windows(2)
+         .find_map(|pair| {
+            match (pair[0].1, pair[1].1) {
+               (
+                  Insn::MovZ {
+                     rd: 2,
+                     imm,
+                     wide: false,
+                  },
+                  Insn::Bl { target },
+               ) if imm == carousel_len => Some(target),
+               _ => None,
+            }
+         })
+      else {
+         continue;
+      };
+      let Some((_, div_id_code)) = arm64::function(image, candidate) else {
+         continue;
+      };
+      if div_id_code
+         .iter()
+         .any(|&(_, insn)| matches!(insn, Insn::CmpImm { imm: 0xFF, .. }))
+      {
+         div_ids.push(candidate);
+      }
+   }
+   let div_id = one("Div::id call after carousel anchor", &sorted(div_ids))?;
 
    let scale = arm64_modal_scale(image, modal_new, modal_size)?;
    let subtitle = arm64_modal_subtitle(image, modal_new, modal_size)?;
